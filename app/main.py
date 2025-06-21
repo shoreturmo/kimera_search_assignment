@@ -2,84 +2,92 @@ from fastapi import FastAPI, HTTPException
 import numpy as np
 import os
 import time
+import subprocess
+from io import StringIO
 
 # --- Configuration ---
 DATA_DIR = "/app/data"
 RAW_EMBEDDINGS_FILE = os.path.join(DATA_DIR, "embeddings.bin")
+SEARCH_INDEX_FILE = os.path.join(DATA_DIR, "search.index")
+SEARCH_TOOL = "/app/search_core/search_tool"
 EMBEDDING_DIM = 128
 NUM_EMBEDDINGS = int(os.getenv("NUM_EMBEDDINGS", 10000))
 
 app = FastAPI(
     title="Kimera High-Performance Search API",
-    description="An API for finding approximate nearest neighbors in a vector dataset."
+    description="An API for finding approximate nearest neighbors in a vector dataset.",
 )
 
 # --- Global State ---
 raw_embeddings: np.ndarray = None
-# This variable is available for you to store any data structures
-# that you prepare on startup to make subsequent searches faster.
-search_accelerator = None
+
 
 @app.on_event("startup")
 def startup_event():
     """
-    On startup, load the raw embeddings from disk. This is a good place
-    to perform any one-time setup that your search method may require.
+    On startup, load the raw embeddings from disk for query lookup.
+    The C++ tool handles the actual search.
     """
-    global raw_embeddings, search_accelerator
+    global raw_embeddings
 
     if not os.path.exists(RAW_EMBEDDINGS_FILE):
-        raise RuntimeError(f"Data file not found at '{RAW_EMBEDDINGS_FILE}'. Ensure Docker CMD generates it.")
+        raise RuntimeError(
+            f"Data file not found at '{RAW_EMBEDDINGS_FILE}'. Ensure Docker CMD generates it."
+        )
+
+    if not os.path.exists(SEARCH_INDEX_FILE):
+        raise RuntimeError(
+            f"Search index not found at '{SEARCH_INDEX_FILE}'. Ensure Docker CMD builds it."
+        )
 
     print(f"Loading {NUM_EMBEDDINGS} embeddings from '{RAW_EMBEDDINGS_FILE}'...")
-
-
     raw_embeddings = np.fromfile(RAW_EMBEDDINGS_FILE, dtype=np.float32).reshape(
         NUM_EMBEDDINGS, EMBEDDING_DIM
     )
-    
-    # TODO: Perform any one-time setup needed for your search implementation.
-    # The result of this can be stored in the global `search_accelerator` variable.
-    print("Performing one-time setup for search...")
-    # --- YOUR SETUP LOGIC GOES HERE ---
-    
-    
-    # ------------------------------------
     print("Service is ready.")
 
 
 @app.get("/search")
 def search(item_id: int, num_neighbors: int):
     start_time = time.time()
-    
-    # Get the query vector for the given item_id.
-    query_vector = np.expand_dims(raw_embeddings[item_id], axis=0)
 
-    # TODO: Implement your search logic here to find the nearest neighbors.
-    # Your implementation will be evaluated on its performance.
-    
-    # --- YOUR SEARCH LOGIC GOES HERE ---
-    
-    # Placeholder values for the search results.
-    # Your logic should populate these with the actual indices and distances/scores.
-    distances = np.array([[]])
-    indices = np.array([[]])
+    # Get the query vector
+    query_vector = raw_embeddings[item_id]
 
-    # -------------------------------------
-    
-    results = []
-    for i in range(len(indices[0])):
-        idx = int(indices[0][i])
-        if idx != item_id:
-            results.append({
-                "item_id": idx,
-                "score": float(distances[0][i])
-            })
-    
+    # Format query for C++ tool
+    query_str = f"{num_neighbors + 1}," + ",".join(map(str, query_vector))
+
+    try:
+        # Execute C++ search tool with num_embeddings parameter
+        process = subprocess.Popen(
+            [SEARCH_TOOL, "search", SEARCH_INDEX_FILE, str(NUM_EMBEDDINGS)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # Send query and get results
+        stdout, stderr = process.communicate(input=query_str + "\n")
+
+        if process.returncode != 0:
+            raise RuntimeError(f"Search failed: {stderr}")
+
+        # Parse results (format: index,score per line)
+        results = []
+        for line in StringIO(stdout):
+            if line.strip():
+                idx, score = map(float, line.strip().split(","))
+                if int(idx) != item_id:
+                    results.append({"item_id": int(idx), "score": score})
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     search_time = time.time() - start_time
 
     return {
-        "query_item_id": item_id, 
-        "results": results[:num_neighbors], 
-        "time_ms": search_time * 1000
+        "query_item_id": item_id,
+        "results": results[:num_neighbors],
+        "time_ms": search_time * 1000,
     }
