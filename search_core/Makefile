@@ -1,6 +1,6 @@
 # Compiler and flags
 CXX = g++
-CXXFLAGS = -std=c++17 -O3 -march=native -ffast-math -Wall -Wextra
+CXXFLAGS = -std=c++17 -O3 -march=native -mavx2 -ffast-math -Wall -Wextra
 LDFLAGS = -lopenblas
 
 # Target executable

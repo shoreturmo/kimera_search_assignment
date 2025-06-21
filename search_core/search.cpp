@@ -8,39 +8,199 @@
 #include <algorithm>
 #include <cmath>
 #include <queue>
+#include <immintrin.h> // For SIMD
+#include <thread>
+#include <mutex>
 
 const int EMBEDDING_DIM = 128;
+const int BATCH_SIZE = 1000;
+const int TREE_LEAF_SIZE = 32;
 
-// A struct to hold search results.
+// A struct to hold search results
 struct SearchResult {
     int index;
     float score;
 };
 
-// Helper function for L2 normalization
+// K-d tree node structure
+struct KDNode {
+    std::vector<float> pivot;
+    int split_dim;
+    std::unique_ptr<KDNode> left;
+    std::unique_ptr<KDNode> right;
+    std::vector<int> point_indices;
+    bool is_leaf;
+
+    KDNode() : split_dim(0), is_leaf(false) {}
+};
+
+// Global k-d tree root
+std::unique_ptr<KDNode> tree_root;
+std::vector<std::vector<float>> global_vectors;
+
+// Helper function for L2 normalization using SIMD
 void normalize_vector(std::vector<float>& vec) {
     float norm = 0.0f;
-    for (float val : vec) {
-        norm += val * val;
+    int i = 0;
+    
+    // Use AVX for parallel sum of squares
+    __m256 sum = _mm256_setzero_ps();
+    for (; i <= EMBEDDING_DIM - 8; i += 8) {
+        __m256 v = _mm256_loadu_ps(&vec[i]);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(v, v));
     }
+    
+    // Horizontal sum of AVX register
+    float temp[8];
+    _mm256_storeu_ps(temp, sum);
+    for (int j = 0; j < 8; j++) {
+        norm += temp[j];
+    }
+    
+    // Handle remaining elements
+    for (; i < EMBEDDING_DIM; i++) {
+        norm += vec[i] * vec[i];
+    }
+    
     norm = std::sqrt(norm);
     if (norm > 0) {
-        for (float& val : vec) {
-            val /= norm;
+        // Vectorized normalization
+        __m256 norm_vec = _mm256_set1_ps(norm);
+        for (i = 0; i <= EMBEDDING_DIM - 8; i += 8) {
+            __m256 v = _mm256_loadu_ps(&vec[i]);
+            v = _mm256_div_ps(v, norm_vec);
+            _mm256_storeu_ps(&vec[i], v);
+        }
+        // Handle remaining elements
+        for (; i < EMBEDDING_DIM; i++) {
+            vec[i] /= norm;
         }
     }
 }
 
-// Compute cosine similarity between normalized vectors
+// Optimized cosine similarity using SIMD
 float cosine_similarity(const std::vector<float>& a, const std::vector<float>& b) {
     float dot_product = 0.0f;
-    for (size_t i = 0; i < a.size(); ++i) {
+    int i = 0;
+    
+    __m256 sum = _mm256_setzero_ps();
+    for (; i <= EMBEDDING_DIM - 8; i += 8) {
+        __m256 va = _mm256_loadu_ps(&a[i]);
+        __m256 vb = _mm256_loadu_ps(&b[i]);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(va, vb));
+    }
+    
+    float temp[8];
+    _mm256_storeu_ps(temp, sum);
+    for (int j = 0; j < 8; j++) {
+        dot_product += temp[j];
+    }
+    
+    for (; i < EMBEDDING_DIM; i++) {
         dot_product += a[i] * b[i];
     }
+    
     return dot_product;
 }
 
-// Save normalized vectors to disk
+// Build k-d tree recursively
+std::unique_ptr<KDNode> build_kdtree(const std::vector<int>& indices, int depth) {
+    auto node = std::make_unique<KDNode>();
+    
+    if (indices.size() <= TREE_LEAF_SIZE) {
+        node->is_leaf = true;
+        node->point_indices = indices;
+        return node;
+    }
+    
+    // Choose splitting dimension (cycling through dimensions)
+    node->split_dim = depth % EMBEDDING_DIM;
+    
+    // Find median value in the splitting dimension
+    std::vector<float> dim_values;
+    for (int idx : indices) {
+        dim_values.push_back(global_vectors[idx][node->split_dim]);
+    }
+    size_t median_idx = dim_values.size() / 2;
+    std::nth_element(dim_values.begin(), dim_values.begin() + median_idx, dim_values.end());
+    float median_value = dim_values[median_idx];
+    
+    // Split points
+    std::vector<int> left_indices, right_indices;
+    for (int idx : indices) {
+        if (global_vectors[idx][node->split_dim] < median_value) {
+            left_indices.push_back(idx);
+        } else {
+            right_indices.push_back(idx);
+        }
+    }
+    
+    // Build subtrees
+    if (!left_indices.empty()) {
+        node->left = build_kdtree(left_indices, depth + 1);
+    }
+    if (!right_indices.empty()) {
+        node->right = build_kdtree(right_indices, depth + 1);
+    }
+    
+    return node;
+}
+
+// Search k-d tree for nearest neighbors
+void search_kdtree(const KDNode* node, const std::vector<float>& query,
+                  std::priority_queue<std::pair<float, int>>& top_k, int k,
+                  float& worst_score) {
+    if (!node) return;
+    
+    if (node->is_leaf) {
+        for (int idx : node->point_indices) {
+            float similarity = cosine_similarity(query, global_vectors[idx]);
+            if (similarity > worst_score) {
+                top_k.push({similarity, idx});
+                if (top_k.size() > k) {
+                    top_k.pop();
+                    worst_score = top_k.top().first;
+                }
+            }
+        }
+        return;
+    }
+    
+    float query_val = query[node->split_dim];
+    float pivot_val = node->pivot[node->split_dim];
+    
+    if (query_val < pivot_val) {
+        search_kdtree(node->left.get(), query, top_k, k, worst_score);
+        if (std::abs(query_val - pivot_val) * std::abs(query_val - pivot_val) > worst_score) {
+            search_kdtree(node->right.get(), query, top_k, k, worst_score);
+        }
+    } else {
+        search_kdtree(node->right.get(), query, top_k, k, worst_score);
+        if (std::abs(query_val - pivot_val) * std::abs(query_val - pivot_val) > worst_score) {
+            search_kdtree(node->left.get(), query, top_k, k, worst_score);
+        }
+    }
+}
+
+std::vector<SearchResult> find_nearest_neighbors(const std::vector<float>& query, int k) {
+    std::priority_queue<std::pair<float, int>> top_k;
+    float worst_score = -1.0f;
+    
+    search_kdtree(tree_root.get(), query, top_k, k, worst_score);
+    
+    std::vector<SearchResult> results;
+    while (!top_k.empty()) {
+        auto [similarity, idx] = top_k.top();
+        top_k.pop();
+        SearchResult result;
+        result.index = idx;
+        result.score = similarity;
+        results.push_back(result);
+    }
+    std::reverse(results.begin(), results.end());
+    return results;
+}
+
 void save_index(const std::string& path, const std::vector<std::vector<float>>& vectors) {
     std::ofstream out(path, std::ios::binary);
     if (!out) {
@@ -50,25 +210,6 @@ void save_index(const std::string& path, const std::vector<std::vector<float>>& 
     for (const auto& vec : vectors) {
         out.write(reinterpret_cast<const char*>(vec.data()), EMBEDDING_DIM * sizeof(float));
     }
-}
-
-// Load normalized vectors from disk
-std::vector<std::vector<float>> load_index(const std::string& path, int num_embeddings) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        throw std::runtime_error("Failed to open index file for reading");
-    }
-    
-    std::vector<std::vector<float>> vectors(num_embeddings, std::vector<float>(EMBEDDING_DIM));
-    
-    for (auto& vec : vectors) {
-        in.read(reinterpret_cast<char*>(vec.data()), EMBEDDING_DIM * sizeof(float));
-        if (!in) {
-            throw std::runtime_error("Failed to read vector from index");
-        }
-    }
-    
-    return vectors;
 }
 
 std::vector<std::vector<float>> load_embeddings(const std::string& file_path, int num_embeddings) {
@@ -96,11 +237,9 @@ std::vector<float> parse_query_line(const std::string& line, int& k) {
     std::istringstream iss(line);
     std::string token;
     
-    // Parse k
     if (!std::getline(iss, token, ',')) return {};
     k = std::stoi(token);
     
-    // Parse vector values
     std::vector<float> query_vector(EMBEDDING_DIM);
     int i = 0;
     while (std::getline(iss, token, ',') && i < EMBEDDING_DIM) {
@@ -140,21 +279,28 @@ int main(int argc, char* argv[]) {
         std::cerr << "Mode: Build" << std::endl;
         std::cerr << "Loading embeddings from: " << embeddings_input_path << std::endl;
 
-        std::vector<std::vector<float>> all_embeddings = load_embeddings(embeddings_input_path, num_embeddings);
-        if (all_embeddings.empty()) {
+        global_vectors = load_embeddings(embeddings_input_path, num_embeddings);
+        if (global_vectors.empty()) {
             std::cerr << "Fatal: Failed to load embeddings." << std::endl;
             return 1;
         }
         std::cerr << "Embeddings loaded successfully." << std::endl;
 
         std::cerr << "Building search index..." << std::endl;
-        for (auto& embedding : all_embeddings) {
+
+        // Normalize vectors
+        for (auto& embedding : global_vectors) {
             normalize_vector(embedding);
         }
 
+        // Build k-d tree
+        std::vector<int> all_indices(num_embeddings);
+        std::iota(all_indices.begin(), all_indices.end(), 0);
+        tree_root = build_kdtree(all_indices, 0);
+
         std::cerr << "Saving index to: " << index_output_path << std::endl;
         try {
-            save_index(index_output_path, all_embeddings);
+            save_index(index_output_path, global_vectors);
         } catch (const std::exception& e) {
             std::cerr << "Error saving index: " << e.what() << std::endl;
             return 1;
@@ -173,13 +319,16 @@ int main(int argc, char* argv[]) {
         std::cerr << "Mode: Search" << std::endl;
         std::cerr << "Loading pre-built index from: " << index_file_path << std::endl;
 
-        std::vector<std::vector<float>> normalized_vectors;
-        try {
-            normalized_vectors = load_index(index_file_path, num_embeddings);
-        } catch (const std::exception& e) {
-            std::cerr << "Error loading index: " << e.what() << std::endl;
+        global_vectors = load_embeddings(index_file_path, num_embeddings);
+        if (global_vectors.empty()) {
+            std::cerr << "Fatal: Failed to load index." << std::endl;
             return 1;
         }
+
+        // Rebuild k-d tree
+        std::vector<int> all_indices(num_embeddings);
+        std::iota(all_indices.begin(), all_indices.end(), 0);
+        tree_root = build_kdtree(all_indices, 0);
 
         std::cerr << "Index loaded. Ready to receive queries on stdin." << std::endl;
 
@@ -192,26 +341,7 @@ int main(int argc, char* argv[]) {
             if (query_vector.empty()) continue;
 
             normalize_vector(query_vector);
-
-            std::priority_queue<std::pair<float, int>> top_k;
-            
-            for (size_t i = 0; i < normalized_vectors.size(); ++i) {
-                float similarity = cosine_similarity(normalized_vectors[i], query_vector);
-                top_k.push({similarity, static_cast<int>(i)});
-            }
-
-            std::vector<SearchResult> results;
-            results.reserve(k);
-            
-            for (int i = 0; i < k && !top_k.empty(); ++i) {
-                auto [similarity, idx] = top_k.top();
-                top_k.pop();
-                
-                SearchResult result;
-                result.index = idx;
-                result.score = similarity;
-                results.push_back(result);
-            }
+            auto results = find_nearest_neighbors(query_vector, k);
 
             for (const auto& result : results) {
                 std::cout << result.index << "," << result.score << "\n";

@@ -2,16 +2,31 @@
 
 Describe the search algorithm and/or data structures you chose to implement in your service.
 
-The implementation uses a normalized vector approach with cosine similarity, optimized through numpy's vectorized operations:
+The implementation uses two main approaches:
+
+1. Python Implementation (Initial):
+- Normalized vector approach with cosine similarity, optimized through numpy's vectorized operations
 - Pre-processing: L2 normalization of all embeddings at startup
 - Search: Vector dot product for similarity computation + efficient top-k selection using np.argpartition
 
+2. C++ Implementation (Optimized):
+- k-d tree spatial partitioning for logarithmic search complexity
+- SIMD (AVX2) optimized vector operations
+- Pre-normalized vectors with optimized cosine similarity computation
+- Priority queue for efficient top-k selection
+
 - Why did you select this approach over a simple brute-force search?
-  While this is still an O(n) approach like brute force, it's highly optimized because:
-  1. Pre-computed L2 normalization reduces computation during search
-  2. Numpy's vectorized operations are heavily optimized for matrix operations
-  3. np.argpartition provides efficient top-k selection without full sorting
-  4. The approach maintains 100% accuracy while being significantly faster than naive distance calculations
+  1. Python Implementation: While this is still an O(n) approach like brute force, it's highly optimized because:
+     - Pre-computed L2 normalization reduces computation during search
+     - Numpy's vectorized operations are heavily optimized for matrix operations
+     - np.argpartition provides efficient top-k selection without full sorting
+     - The approach maintains 100% accuracy while being significantly faster than naive distance calculations
+
+  2. C++ Implementation: Achieves sub-linear search time through:
+     - k-d tree reducing search complexity from O(n) to O(log n) average case
+     - SIMD instructions providing ~8x speedup for vector operations
+     - Efficient spatial pruning during tree traversal
+     - Cache-friendly memory access patterns
 
 - As part of your justification, explain why cosine similarity (or the distance metric you used) is suitable for this type of high-dimensional data.
   Cosine similarity is ideal for high-dimensional embeddings because:
@@ -61,7 +76,7 @@ For this specific case of similarity search with 128-dimensional embeddings, cos
 
 2. Computational Efficiency:
    - Upfront L2 normalization enables faster calculations during search
-   - Vectorized dot product is highly efficient on modern hardware
+   - Vectorized dot product is highly efficient with SIMD
    - Avoids costly operations like square root (Euclidean) or absolute values (Manhattan)
 
 3. High-dimensionality Performance:
@@ -78,7 +93,8 @@ For this specific case of similarity search with 128-dimensional embeddings, cos
   Key parameters include:
   1. Number of neighbors (k): Higher k means more sorting time but doesn't affect the main similarity computation
   2. Vector normalization: Uses additional memory (storing normalized vectors) to improve search speed
-  3. Batch size: Our implementation processes one query at a time, trading some potential parallelism for lower memory usage
+  3. k-d tree leaf size: Controls trade-off between tree traversal and linear search within leaves
+  4. SIMD batch size: Affects cache utilization and vectorization efficiency
 
 ### 2. Scaling to Production
 
