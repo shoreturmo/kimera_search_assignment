@@ -11,6 +11,8 @@
 #include <immintrin.h> // For SIMD
 #include <thread>
 #include <mutex>
+#include <random>
+#include <unordered_map>
 
 const int EMBEDDING_DIM = 128;
 const int BATCH_SIZE = 1000;
@@ -22,20 +24,14 @@ struct SearchResult {
     float score;
 };
 
-// K-d tree node structure
-struct KDNode {
-    std::vector<float> pivot;
-    int split_dim;
-    std::unique_ptr<KDNode> left;
-    std::unique_ptr<KDNode> right;
-    std::vector<int> point_indices;
-    bool is_leaf;
+// LSH parameters
+const int LSH_NUM_TABLES = 10;
+const int LSH_KEY_SIZE = 16;
 
-    KDNode() : split_dim(0), is_leaf(false) {}
-};
-
-// Global k-d tree root
-std::unique_ptr<KDNode> tree_root;
+// LSH hash tables
+typedef std::vector<int> HashKey;
+std::vector<std::unordered_map<std::string, std::vector<int>>> lsh_tables;
+std::vector<std::vector<float>> lsh_random_vectors;
 std::vector<std::vector<float>> global_vectors;
 
 // Helper function for L2 normalization using SIMD
@@ -103,99 +99,80 @@ float cosine_similarity(const std::vector<float>& a, const std::vector<float>& b
     return dot_product;
 }
 
-// Build k-d tree recursively
-std::unique_ptr<KDNode> build_kdtree(const std::vector<int>& indices, int depth) {
-    auto node = std::make_unique<KDNode>();
-    
-    if (indices.size() <= TREE_LEAF_SIZE) {
-        node->is_leaf = true;
-        node->point_indices = indices;
-        return node;
-    }
-    
-    // Choose splitting dimension (cycling through dimensions)
-    node->split_dim = depth % EMBEDDING_DIM;
-    
-    // Find median value in the splitting dimension
-    std::vector<float> dim_values;
-    for (int idx : indices) {
-        dim_values.push_back(global_vectors[idx][node->split_dim]);
-    }
-    size_t median_idx = dim_values.size() / 2;
-    std::nth_element(dim_values.begin(), dim_values.begin() + median_idx, dim_values.end());
-    float median_value = dim_values[median_idx];
-    
-    // Split points
-    std::vector<int> left_indices, right_indices;
-    for (int idx : indices) {
-        if (global_vectors[idx][node->split_dim] < median_value) {
-            left_indices.push_back(idx);
-        } else {
-            right_indices.push_back(idx);
+// Helper: generate random hyperplanes for LSH
+void generate_lsh_planes(int num_tables, int key_size, int dim) {
+    std::mt19937 gen(42);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    lsh_random_vectors.clear();
+    for (int t = 0; t < num_tables * key_size; ++t) {
+        std::vector<float> plane(dim);
+        for (int d = 0; d < dim; ++d) {
+            plane[d] = dist(gen);
         }
+        lsh_random_vectors.push_back(plane);
     }
-    
-    // Build subtrees
-    if (!left_indices.empty()) {
-        node->left = build_kdtree(left_indices, depth + 1);
-    }
-    if (!right_indices.empty()) {
-        node->right = build_kdtree(right_indices, depth + 1);
-    }
-    
-    return node;
 }
 
-// Search k-d tree for nearest neighbors
-void search_kdtree(const KDNode* node, const std::vector<float>& query,
-                  std::priority_queue<std::pair<float, int>>& top_k, int k,
-                  float& worst_score) {
-    if (!node) return;
-    
-    if (node->is_leaf) {
-        for (int idx : node->point_indices) {
-            float similarity = cosine_similarity(query, global_vectors[idx]);
-            if (similarity > worst_score) {
-                top_k.push({similarity, idx});
-                if (top_k.size() > k) {
-                    top_k.pop();
-                    worst_score = top_k.top().first;
-                }
+// Helper: compute LSH key for a vector
+std::string compute_lsh_key(const std::vector<float>& vec, int table_idx) {
+    std::string key;
+    int offset = table_idx * LSH_KEY_SIZE;
+    for (int i = 0; i < LSH_KEY_SIZE; ++i) {
+        float dot = 0.0f;
+        for (int d = 0; d < EMBEDDING_DIM; ++d) {
+            dot += vec[d] * lsh_random_vectors[offset + i][d];
+        }
+        key += (dot > 0 ? '1' : '0');
+    }
+    return key;
+}
+
+// Build LSH index
+template<typename T>
+void build_lsh_index(const std::vector<T>& vectors) {
+    lsh_tables.clear();
+    lsh_tables.resize(LSH_NUM_TABLES);
+    for (int t = 0; t < LSH_NUM_TABLES; ++t) {
+        for (int i = 0; i < (int)vectors.size(); ++i) {
+            std::string key = compute_lsh_key(vectors[i], t);
+            lsh_tables[t][key].push_back(i);
+        }
+    }
+}
+
+// ANN search using LSH
+std::vector<SearchResult> ann_search(const std::vector<float>& query, int k) {
+    std::unordered_map<int, bool> candidate_set;
+    for (int t = 0; t < LSH_NUM_TABLES; ++t) {
+        std::string key = compute_lsh_key(query, t);
+        auto it = lsh_tables[t].find(key);
+        if (it != lsh_tables[t].end()) {
+            for (int idx : it->second) {
+                candidate_set[idx] = true;
             }
         }
-        return;
     }
-    
-    float query_val = query[node->split_dim];
-    float pivot_val = node->pivot[node->split_dim];
-    
-    if (query_val < pivot_val) {
-        search_kdtree(node->left.get(), query, top_k, k, worst_score);
-        if (std::abs(query_val - pivot_val) * std::abs(query_val - pivot_val) > worst_score) {
-            search_kdtree(node->right.get(), query, top_k, k, worst_score);
-        }
-    } else {
-        search_kdtree(node->right.get(), query, top_k, k, worst_score);
-        if (std::abs(query_val - pivot_val) * std::abs(query_val - pivot_val) > worst_score) {
-            search_kdtree(node->left.get(), query, top_k, k, worst_score);
+    // Fallback: if not enough candidates, use all
+    std::vector<int> candidates;
+    for (const auto& kv : candidate_set) candidates.push_back(kv.first);
+    if ((int)candidates.size() < k) {
+        for (int i = 0; i < (int)global_vectors.size(); ++i) {
+            if (!candidate_set.count(i)) candidates.push_back(i);
+            if ((int)candidates.size() >= k*2) break;
         }
     }
-}
-
-std::vector<SearchResult> find_nearest_neighbors(const std::vector<float>& query, int k) {
+    // Score candidates
     std::priority_queue<std::pair<float, int>> top_k;
-    float worst_score = -1.0f;
-    
-    search_kdtree(tree_root.get(), query, top_k, k, worst_score);
-    
+    for (int idx : candidates) {
+        float sim = cosine_similarity(query, global_vectors[idx]);
+        top_k.push({sim, idx});
+        if ((int)top_k.size() > k) top_k.pop();
+    }
     std::vector<SearchResult> results;
     while (!top_k.empty()) {
-        auto [similarity, idx] = top_k.top();
+        auto [sim, idx] = top_k.top();
         top_k.pop();
-        SearchResult result;
-        result.index = idx;
-        result.score = similarity;
-        results.push_back(result);
+        results.push_back({idx, sim});
     }
     std::reverse(results.begin(), results.end());
     return results;
@@ -286,26 +263,20 @@ int main(int argc, char* argv[]) {
         }
         std::cerr << "Embeddings loaded successfully." << std::endl;
 
-        std::cerr << "Building search index..." << std::endl;
-
-        // Normalize vectors
+        std::cerr << "Building ANN (LSH) index..." << std::endl;
         for (auto& embedding : global_vectors) {
             normalize_vector(embedding);
         }
-
-        // Build k-d tree
-        std::vector<int> all_indices(num_embeddings);
-        std::iota(all_indices.begin(), all_indices.end(), 0);
-        tree_root = build_kdtree(all_indices, 0);
-
-        std::cerr << "Saving index to: " << index_output_path << std::endl;
+        generate_lsh_planes(LSH_NUM_TABLES, LSH_KEY_SIZE, EMBEDDING_DIM);
+        build_lsh_index(global_vectors);
+        std::cerr << "Index built in memory. Saving index to: " << index_output_path << std::endl;
+        // Guardar solo los embeddings, como antes
         try {
             save_index(index_output_path, global_vectors);
         } catch (const std::exception& e) {
             std::cerr << "Error saving index: " << e.what() << std::endl;
             return 1;
         }
-
         std::cerr << "Index built and saved successfully." << std::endl;
 
     } else if (mode == "search") {
@@ -324,25 +295,21 @@ int main(int argc, char* argv[]) {
             std::cerr << "Fatal: Failed to load index." << std::endl;
             return 1;
         }
-
-        // Rebuild k-d tree
-        std::vector<int> all_indices(num_embeddings);
-        std::iota(all_indices.begin(), all_indices.end(), 0);
-        tree_root = build_kdtree(all_indices, 0);
-
+        for (auto& embedding : global_vectors) {
+            normalize_vector(embedding);
+        }
+        generate_lsh_planes(LSH_NUM_TABLES, LSH_KEY_SIZE, EMBEDDING_DIM);
+        build_lsh_index(global_vectors);
         std::cerr << "Index loaded. Ready to receive queries on stdin." << std::endl;
 
         std::string line;
         while (std::getline(std::cin, line)) {
             if (line.empty()) continue;
-
             int k = 0;
             std::vector<float> query_vector = parse_query_line(line, k);
             if (query_vector.empty()) continue;
-
             normalize_vector(query_vector);
-            auto results = find_nearest_neighbors(query_vector, k);
-
+            auto results = ann_search(query_vector, k);
             for (const auto& result : results) {
                 std::cout << result.index << "," << result.score << "\n";
             }
@@ -352,6 +319,5 @@ int main(int argc, char* argv[]) {
         print_usage(argv[0]);
         return 1;
     }
-
     return 0;
 }

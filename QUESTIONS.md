@@ -10,10 +10,16 @@ The implementation uses two main approaches:
 - Search: Vector dot product for similarity computation + efficient top-k selection using np.argpartition
 
 2. C++ Implementation (Optimized):
-- k-d tree spatial partitioning for logarithmic search complexity
+- **Approximate Nearest Neighbor (ANN) using Locality Sensitive Hashing (LSH)**
 - SIMD (AVX2) optimized vector operations
 - Pre-normalized vectors with optimized cosine similarity computation
 - Priority queue for efficient top-k selection
+
+**Why LSH/ANN instead of KD-tree?**
+- KD-tree performance degrades in high dimensions (like 128D embeddings), often approaching brute-force in practice.
+- LSH provides sub-linear search time for high-dimensional data by hashing similar vectors into the same buckets, making it much more scalable for large datasets.
+- LSH is easy to parallelize and has predictable memory usage.
+- The trade-off is a small loss in recall/accuracy (approximate search), but with a significant gain in speed and scalability for large-scale vector search.
 
 - Why did you select this approach over a simple brute-force search?
   1. Python Implementation: While this is still an O(n) approach like brute force, it's highly optimized because:
@@ -23,9 +29,9 @@ The implementation uses two main approaches:
      - The approach maintains 100% accuracy while being significantly faster than naive distance calculations
 
   2. C++ Implementation: Achieves sub-linear search time through:
-     - k-d tree reducing search complexity from O(n) to O(log n) average case
+     - LSH reduces the number of candidate vectors to compare, making search much faster than brute-force or KD-tree in high dimensions
      - SIMD instructions providing ~8x speedup for vector operations
-     - Efficient spatial pruning during tree traversal
+     - Efficient candidate selection and top-k retrieval
      - Cache-friendly memory access patterns
 
 - As part of your justification, explain why cosine similarity (or the distance metric you used) is suitable for this type of high-dimensional data.
